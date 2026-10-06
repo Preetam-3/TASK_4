@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+kubectl-pod_topology - A kubectl plugin that generates a traffic flow image
+showing Ingress -> Service -> Pod relationships with pod health status.
+
+Usage:
+    kubectl pod-topology <pod-name> --namespace <ns> [--output <path>]
+    kubectl pod-topology nginx-topology-65b47b4648-4nktm --namespace default --output /tmp/topology.png
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+from openai import OpenAI
+import requests
+
+# Load environment variables from the current directory first, then script directory.
+SCRIPT_DIR = Path(__file__).resolve().parent
+WORK_DIR = Path.cwd()
+load_dotenv(dotenv_path=WORK_DIR / ".env.local")
+load_dotenv(dotenv_path=WORK_DIR / ".env")
+load_dotenv(dotenv_path=SCRIPT_DIR / ".env.local")
+load_dotenv(dotenv_path=SCRIPT_DIR / ".env")
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+LUMA_API_KEY = os.environ.get("LUMA_API_KEY") or os.environ.get("LUMA_API_TOKEN")
+
+LUMA_API_URL = "https://agents.lumalabs.ai/v1/generations"
+LUMA_MODEL = "uni-1"
+
+# ---------------------------------------------------------------------------
+# Hardcoded image generation prompt template.
+# Cluster data (ingresses, services, pods) is injected into the placeholders
+# so the visual style stays consistent across every run.
+# ---------------------------------------------------------------------------
+IMAGE_PROMPT_TEMPLATE = """
+Create a clean, technical architecture diagram on a dark navy (#0D1117) background
+showing Kubernetes traffic flow with the following layout:
+
+FLOW DIRECTION: Left to right with labeled arrows
+STYLE: Flat, modern infographic with rounded rectangles and color-coded status badges
+
+--- CLUSTER DATA ---
+{cluster_summary}
+--- END CLUSTER DATA ---
+
+LAYOUT RULES:
+1. LEFT COLUMN - Internet / External Traffic:
+   - Draw a globe icon labeled "Internet" at the far left.
+
+2. MIDDLE-LEFT COLUMN - Ingress Resources:
+   For each ingress listed above, draw a rectangle labeled with its name and host.
+   Color: Teal (#00BFA5). Show the namespace below the name in smaller text.
+
+3. MIDDLE COLUMN - Services:
+   For each service, draw a rectangle with its name and port(s).
+   Color: Blue (#1565C0). Connect from the matching ingress with a solid arrow.
+
+4. RIGHT COLUMN - Pods:
+   For each pod, draw a rectangle showing name and container image (shortened).
+   Status badge in top-right corner:
+     - Running: solid green circle (#00C853)
+     - Pending:  solid yellow circle (#FFD600)
+     - Failed:   solid red circle (#D50000)
+     - CrashLoopBackOff: blinking red circle (#FF1744)
+     - Unknown:  solid grey circle (#607D8B)
+   Connect from the matching service with a solid arrow.
+
+5. ARROWS: White (#FFFFFF) with arrowheads. Label each arrow with the protocol
+   and port (e.g. "HTTP :80", "HTTPS :443", "TCP :8080").
+
+6. TITLE: "Kubernetes Pod Traffic Topology" in white at the top center, 24 pt bold.
+
+7. LEGEND in bottom-left corner showing all status badge colors.
+
+Keep the diagram clean, no shadows, sans-serif font (Inter or Roboto).
+Image dimensions should feel like a wide 16:9 banner (landscape orientation).
+"""
+
+
+def run_kubectl(args: list[str]) -> dict:
+    """Run a kubectl command and return parsed JSON output."""
+    cmd = ["kubectl"] + args + ["-o", "json"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        print("ERROR: kubectl not found. Make sure kubectl is installed and in your PATH.")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: kubectl command timed out: {' '.join(cmd)}")
+        sys.exit(1)
+
+    if result.returncode != 0:
+        # Non-fatal: some resource types may not exist in the namespace
+        return {}
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def gather_cluster_resources(namespace: str) -> dict:
+    """Collect Ingress, Service, and Pod resources from the cluster."""
+    ns_flag = ["--namespace", namespace] if namespace != "all" else ["--all-namespaces"]
+
+    print(f"  Fetching Ingresses   ...")
+    ingresses_raw = run_kubectl(["get", "ingresses"] + ns_flag)
+
+    print(f"  Fetching Services    ...")
+    services_raw  = run_kubectl(["get", "services"]  + ns_flag)
+
+    print(f"  Fetching Pods        ...")
+    pods_raw      = run_kubectl(["get", "pods"]      + ns_flag)
+
+    def extract_items(raw):
+        if isinstance(raw, dict) and "items" in raw:
+            return raw["items"]
+        return []
+
+    return {
+        "ingresses": extract_items(ingresses_raw),
+        "services":  extract_items(services_raw),
+        "pods":      extract_items(pods_raw),
+    }
+
+
+def selector_matches_pod(selector: dict, pod_labels: dict) -> bool:
+    """Return True if every service selector label is present on the pod."""
+    if not selector:
+        return False
+    for key, value in selector.items():
+        if pod_labels.get(key) != value:
+            return False
+    return True
+
+
+def extract_ingress_service_names(ingress: dict) -> set:
+    """Extract referenced backend service names from an ingress object."""
+    names = set()
+    spec = ingress.get("spec", {})
+
+    default_backend = spec.get("defaultBackend", {})
+    default_service = default_backend.get("service", {})
+    default_service_name = default_service.get("name")
+    if default_service_name:
+        names.add(default_service_name)
+
+    for rule in spec.get("rules", []):
+        http = rule.get("http", {})
+        for path in http.get("paths", []):
+            backend = path.get("backend", {})
+            service = backend.get("service", {})
+            service_name = service.get("name")
+            if service_name:
+                names.add(service_name)
+
+    return names
+
+
+def filter_resources_for_pod(resources: dict, pod_name: str) -> dict:
+    """
+    Keep only resources participating in the flow for the target pod:
+    Ingress -> Service -> Pod.
+    """
+    pods = resources.get("pods", [])
+
+    # First try an exact match. If none found, allow prefix match for convenience.
+    target_pods = [
+        pod for pod in pods
+        if pod.get("metadata", {}).get("name") == pod_name
+    ]
+    if not target_pods:
+        target_pods = [
+            pod for pod in pods
+            if pod.get("metadata", {}).get("name", "").startswith(pod_name)
+        ]
+
+    if not target_pods:
+        print(f"ERROR: Pod '{pod_name}' not found in the selected namespace scope.")
+        sys.exit(1)
+
+    if len(target_pods) > 1:
+        matches = ", ".join(
+            pod.get("metadata", {}).get("name", "")
+            for pod in target_pods
+        )
+        print(f"INFO: Pod prefix matched multiple pods: {matches}")
+
+    matched_pods_by_ns = {}
+    for pod in target_pods:
+        namespace = pod.get("metadata", {}).get("namespace")
+        matched_pods_by_ns.setdefault(namespace, []).append(pod)
+
+    filtered_services = []
+    for service in resources.get("services", []):
+        namespace = service.get("metadata", {}).get("namespace")
+        selector = service.get("spec", {}).get("selector", {})
+        for pod in matched_pods_by_ns.get(namespace, []):
+            labels = pod.get("metadata", {}).get("labels", {})
+            if selector_matches_pod(selector, labels):
+                filtered_services.append(service)
+                break
+
+    service_keys = {
+        (
+            service.get("metadata", {}).get("namespace"),
+            service.get("metadata", {}).get("name"),
+        )
+        for service in filtered_services
+    }
+
+    filtered_ingresses = []
+    for ingress in resources.get("ingresses", []):
+        namespace = ingress.get("metadata", {}).get("namespace")
+        backend_names = extract_ingress_service_names(ingress)
+        for backend_name in backend_names:
+            if (namespace, backend_name) in service_keys:
+                filtered_ingresses.append(ingress)
+                break
+
+    return {
+        "ingresses": filtered_ingresses,
+        "services": filtered_services,
+        "pods": target_pods,
+    }
+
+
+def analyze_with_openai(resources: dict) -> str:
+    """
+    Use OpenAI to interpret raw Kubernetes JSON and return a structured,
+    human-readable cluster summary describing traffic flow relationships.
+    """
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # Slim down the payload so we stay within token limits
+    slim = {
+        "ingresses": [
+            {
+                "name":      i.get("metadata", {}).get("name"),
+                "namespace": i.get("metadata", {}).get("namespace"),
+                "rules":     i.get("spec", {}).get("rules", []),
+                "tls":       i.get("spec", {}).get("tls", []),
+            }
+            for i in resources["ingresses"]
+        ],
+        "services": [
+            {
+                "name":      s.get("metadata", {}).get("name"),
+                "namespace": s.get("metadata", {}).get("namespace"),
+                "type":      s.get("spec", {}).get("type"),
+                "selector":  s.get("spec", {}).get("selector", {}),
+                "ports":     s.get("spec", {}).get("ports", []),
+            }
+            for s in resources["services"]
+            if s.get("spec", {}).get("type") != "ExternalName"
+        ],
+        "pods": [
+            {
+                "name":       p.get("metadata", {}).get("name"),
+                "namespace":  p.get("metadata", {}).get("namespace"),
+                "labels":     p.get("metadata", {}).get("labels", {}),
+                "phase":      p.get("status", {}).get("phase"),
+                "conditions": p.get("status", {}).get("conditions", []),
+                "containers": [
+                    {
+                        "name":  c.get("name"),
+                        "image": c.get("image"),
+                        "state": p.get("status", {}).get("containerStatuses", [{}])[idx].get("state", {})
+                                 if idx < len(p.get("status", {}).get("containerStatuses", []))
+                                 else {},
+                    }
+                    for idx, c in enumerate(p.get("spec", {}).get("containers", []))
+                ],
+            }
+            for p in resources["pods"]
+        ],
+    }
+
+    system_prompt = (
+        "You are a Kubernetes expert. Given raw Kubernetes resource data you will "
+        "produce a concise, structured plain-text summary of the traffic flow from "
+        "Ingress -> Service -> Pod. For every relationship you find, describe:\n"
+        "  1. The Ingress name, namespace, host(s), and TLS status.\n"
+        "  2. The backend Service it routes to, its type, and its port(s).\n"
+        "  3. The Pods selected by that Service (matched via label selectors), "
+        "     their status (Running/Pending/Failed/CrashLoopBackOff), and container images.\n"
+        "If a Service has no matching Pods, note that explicitly.\n"
+        "If an Ingress has no Service match, note that explicitly.\n"
+        "Keep the output structured but human-readable - no JSON, use bullet points."
+    )
+
+    user_message = (
+        "Here is the cluster resource data in JSON format:\n\n"
+        + json.dumps(slim, indent=2)
+    )
+
+    print("  Analyzing relationships with OpenAI ...")
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_message},
+        ],
+        max_tokens=2048,
+        temperature=0.2,
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+def generate_image_with_luma(cluster_summary: str, output_path: str) -> None:
+    """
+    Build the final image prompt with the cluster summary injected, then call
+    the Luma AI image generation API (UNI-1 model) and save the result.
+    """
+    final_prompt = IMAGE_PROMPT_TEMPLATE.format(cluster_summary=cluster_summary)
+
+    headers = {
+        "Authorization": f"Bearer {LUMA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "prompt": final_prompt,
+        "model": LUMA_MODEL,
+        "type": "image",
+        "aspect_ratio": "16:9",
+    }
+
+    print("  Submitting image generation request to Luma AI (UNI-1) ...")
+    response = requests.post(LUMA_API_URL, headers=headers, json=payload, timeout=60)
+    if response.status_code >= 400:
+        print("ERROR: Luma API request failed.")
+        print(response.text)
+        sys.exit(1)
+
+    generation = response.json()
+    generation_id = generation.get("id") or generation.get("generation_id")
+    if not generation_id:
+        print("ERROR: Luma response did not include a generation id.")
+        print(json.dumps(generation, indent=2))
+        sys.exit(1)
+
+    print(f"  Generation ID: {generation_id}")
+    print("  Waiting for Luma AI to render the image ", end="", flush=True)
+
+    def extract_status(payload: dict) -> str:
+        return str(
+            payload.get("state")
+            or payload.get("status")
+            or payload.get("phase")
+            or ""
+        ).lower()
+
+    def extract_image_url(payload: dict):
+        assets = payload.get("assets")
+        if isinstance(assets, dict):
+            for key in ("image", "image_url", "url"):
+                value = assets.get(key)
+                if value:
+                    return value
+
+        for key in ("image_url", "url", "output_url"):
+            value = payload.get(key)
+            if value:
+                return value
+
+        output = payload.get("output")
+        if isinstance(output, list) and output:
+            first = output[0]
+            if isinstance(first, dict):
+                for key in ("image", "image_url", "url"):
+                    value = first.get(key)
+                    if value:
+                        return value
+            elif isinstance(first, str):
+                return first
+
+        return None
+
+    status_url = f"{LUMA_API_URL}/{generation_id}"
+    max_wait_seconds = 300
+    poll_interval = 5
+    elapsed = 0
+    generation_result = generation
+
+    while elapsed < max_wait_seconds:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        print(".", end="", flush=True)
+
+        status_response = requests.get(status_url, headers=headers, timeout=60)
+        if status_response.status_code >= 400:
+            print(f"\nERROR: Luma status request failed ({status_response.status_code}).")
+            print(status_response.text)
+            sys.exit(1)
+
+        generation_result = status_response.json()
+        status = extract_status(generation_result)
+
+        if status in {"completed", "succeeded", "success", "done", "finished"}:
+            print(" done!")
+            break
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            print(f"\nERROR: Luma image generation failed: {generation_result}")
+            sys.exit(1)
+    else:
+        print(f"\nERROR: Timed out after {max_wait_seconds}s waiting for Luma AI.")
+        sys.exit(1)
+
+    image_url = extract_image_url(generation_result)
+    if not image_url:
+        print("ERROR: Could not find image URL in Luma response.")
+        print(json.dumps(generation_result, indent=2))
+        sys.exit(1)
+
+    print(f"  Downloading image from Luma ...")
+    img_response = requests.get(image_url, timeout=60)
+    img_response.raise_for_status()
+
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_bytes(img_response.content)
+
+    print(f"  Image saved to: {output_file.resolve()}")
+
+
+def validate_env():
+    """Ensure required environment variables are present."""
+    missing = []
+    if not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
+    if not LUMA_API_KEY:
+        missing.append("LUMA_API_KEY or LUMA_API_TOKEN")
+    if missing:
+        print("ERROR: The following environment variables are not set:")
+        for key in missing:
+            print(f"  - {key}")
+        print("\nCreate a .env.local or .env file in the plugin directory with these keys.")
+        print("See .env.example for the expected format.")
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="kubectl pod-topology",
+        description=(
+            "Generate a traffic flow diagram image for Kubernetes pods, "
+            "tracing the path from Ingress -> Service -> Pod."
+        ),
+    )
+    parser.add_argument(
+        "pod_name",
+        help="Target pod name (exact name or prefix).",
+    )
+    parser.add_argument(
+        "--namespace", "-n",
+        default="default",
+        help="Kubernetes namespace to inspect (default: 'default', use 'all' for all namespaces).",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default="pod-topology.png",
+        help="Output file path for the generated image (default: pod-topology.png).",
+    )
+
+    args = parser.parse_args()
+
+    print("\n=== kubectl pod-topology ===\n")
+
+    # Step 1: Validate API keys
+    validate_env()
+
+    # Step 2: Gather Kubernetes resources
+    print(f"[1/3] Gathering cluster resources (namespace: {args.namespace}) ...")
+    resources = gather_cluster_resources(args.namespace)
+
+    # Step 3: Filter resources for the selected pod
+    print(f"[2/3] Building topology for pod: {args.pod_name} ...")
+    resources = filter_resources_for_pod(resources, args.pod_name)
+
+    total = (
+        len(resources["ingresses"])
+        + len(resources["services"])
+        + len(resources["pods"])
+    )
+    print(
+        f"      Found {len(resources['ingresses'])} ingress(es), "
+        f"{len(resources['services'])} service(s), "
+        f"{len(resources['pods'])} pod(s)."
+    )
+
+    if total == 0:
+        print("WARNING: No resources found. Make sure your kubeconfig is set correctly.")
+
+    # Step 4: Analyze with OpenAI
+    print("\n[3/4] Analyzing traffic flow with OpenAI ...")
+    cluster_summary = analyze_with_openai(resources)
+
+    print("\n--- Cluster Traffic Summary ---")
+    print(cluster_summary)
+    print("-------------------------------\n")
+
+    # Step 5: Generate image with Luma AI
+    print("[4/4] Generating topology image with Luma AI UNI-1 ...")
+    generate_image_with_luma(cluster_summary, args.output)
+
+    print("\n=== Done! ===")
+    print(f"Topology image: {Path(args.output).resolve()}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+.env
+.env.local
+.env.*
+!.env.example
+*.pyc
+__pycache__/
+*.pyo
+.DS_Store
+generated_images/
+*.png
+*.jpg
+*.jpeg
+venv/
+.venv/
